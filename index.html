@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Seniority Rank Finder</title>
+  <style>
+    :root { --pad: 14px; }
+    html,body { margin:0; padding:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    header { padding: var(--pad); border-bottom: 1px solid #eee; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    h1 { font-size: 20px; margin:0 12px 0 0; }
+    main { padding: var(--pad); max-width: 1200px; margin: 0 auto; }
+    .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom: 12px; }
+    input, select, button { padding:8px 10px; border:1px solid #ccc; border-radius:8px; background:#fff; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { padding:10px; border-bottom:1px solid #eee; text-align:left; }
+    th { background:#fafafa; position: sticky; top: 0; }
+    .muted { color:#666; font-size: 0.9rem; }
+    .good { background:#e9f9ef; }
+    .pill { display:inline-block; padding:2px 8px; border-radius: 999px; border:1px solid #ddd; font-size: 12px; }
+    #status { font-size: 0.95rem; }
+    #diag { margin-top:10px; font-size:0.9rem; color:#555; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Seniority Rank Finder</h1>
+    <span id="status" class="muted">Loading data…</span>
+  </header>
+
+  <main>
+    <div class="controls">
+      <label>Seniority #</label>
+      <input id="sen" type="number" min="1" step="1" placeholder="e.g. 2670" style="width:140px">
+      <label>Base</label>
+      <select id="baseSel"><option value="">All</option></select>
+      <label>Seat</label>
+      <select id="seatSel">
+        <option value="">All</option>
+        <option value="CA">CA</option>
+        <option value="FO">FO</option>
+      </select>
+      <label>Sort by</label>
+      <select id="sortSel">
+        <option value="rank">Best rank</option>
+        <option value="pct">Best base %</option>
+        <option value="total">Largest base size</option>
+        <option value="base">Base</option>
+      </select>
+      <button id="calc">Calculate</button>
+    </div>
+
+    <table id="results">
+      <thead>
+        <tr>
+          <th>Base</th>
+          <th>Seat</th>
+          <th>Rank in base</th>
+          <th>Base size</th>
+          <th>Base % (rank/total)</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <div id="diag" class="muted"></div>
+  </main>
+
+  <script>
+    const MANIFEST = [{"sheet": "ANC_CA", "file": "data/ANC_CA.json"}, {"sheet": "ANC_FO", "file": "data/ANC_FO.json"}, {"sheet": "Best_Base_By_Seat", "file": "data/Best_Base_By_Seat.json"}, {"sheet": "Cutlines_Summary", "file": "data/Cutlines_Summary.json"}, {"sheet": "LAX_CA", "file": "data/LAX_CA.json"}, {"sheet": "PDX_CA", "file": "data/PDX_CA.json"}, {"sheet": "PDX_FO", "file": "data/PDX_FO.json"}, {"sheet": "SEA_CA", "file": "data/SEA_CA.json"}, {"sheet": "SFO_CA", "file": "data/SFO_CA.json"}, {"sheet": "SFO_FO", "file": "data/SFO_FO.json"}];
+
+    const statusEl = document.getElementById('status');
+    const baseSel = document.getElementById('baseSel');
+    const seatSel = document.getElementById('seatSel');
+    const senInput = document.getElementById('sen');
+    const sortSel = document.getElementById('sortSel');
+    const tb = document.querySelector('#results tbody');
+    const diag = document.getElementById('diag');
+
+    // Parse a weird sheet: find the row where any cell === "Original Seniority Number",
+    // use that row's values as column names, then read subsequent rows.
+    function normalizeSheet(rows) {
+      const keys = Object.keys(rows?.[0] || {});
+      let headerIdx = -1, nameByKey = {};
+      for (let i=0;i<rows.length;i++) {
+        const r = rows[i];
+        for (const k of Object.keys(r)) {
+          if (String(r[k]).trim().toLowerCase() === 'original seniority number') {
+            headerIdx = i;
+            break;
+          }
+        }
+        if (headerIdx >= 0) break;
+      }
+      if (headerIdx < 0) return []; // nothing usable
+
+      const headerRow = rows[headerIdx];
+      // Build mapping from column key -> semantic name shown in that header row
+      for (const k of Object.keys(headerRow)) {
+        const v = headerRow[k];
+        if (v != null && String(v).trim() !== '') nameByKey[k] = String(v).trim();
+      }
+
+      // Identify which keys correspond to the fields we need
+      let keySen = null, keyBase = null, keySeat = null;
+      for (const [k,name] of Object.entries(nameByKey)) {
+        const n = name.toLowerCase();
+        if (n.includes('original') && n.includes('seniority')) keySen = k;
+        if (n === 'base') keyBase = k;
+        if (n === 'position') keySeat = k;
+      }
+      if (!keySen || !keyBase || !keySeat) return [];
+
+      // Consume data rows after headerIdx
+      const out = [];
+      for (let i=headerIdx+1;i<rows.length;i++) {
+        const r = rows[i] || {};
+        const sen = Number(r[keySen]);
+        const base = (r[keyBase] ?? '').toString().trim();
+        const seat = (r[keySeat] ?? '').toString().trim();
+        if (!Number.isFinite(sen)) continue;
+        if (!base || !seat) continue;
+        out.push({seniority: sen, base, seat});
+      }
+      return out;
+    }
+
+    async function fetchJSON(url) {
+      const res = await fetch(url, {cache: 'no-store'});
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${url}`);
+      return await res.json();
+    }
+
+    async function loadAll() {
+      const packs = [];
+      for (const m of MANIFEST) {
+        try {
+          const rows = await fetchJSON(m.file);
+          const norm = normalizeSheet(rows);
+          if (norm.length) packs.push({sheet: m.sheet, rows: norm});
+        } catch (e) {
+          console.warn('Failed', m.file, e);
+        }
+      }
+      return packs;
+    }
+
+    function computeRank(list, n) {
+      let count = 0;
+      for (const v of list) if (v <= n) count++;
+      return Math.max(count, 1);
+    }
+
+    function run(database) {
+      const n = parseInt(senInput.value, 10);
+      if (!n || n < 1) { tb.innerHTML = ''; statusEl.textContent = 'Enter a valid seniority number.'; return; }
+      statusEl.textContent = '';
+
+      // Build per base/seat arrays of seniorities
+      const byKey = new Map(); // "SEA|CA" -> [seniority,...]
+      for (const pack of database) {
+        for (const row of pack.rows) {
+          const key = row.base + '|' + row.seat;
+          if (!byKey.has(key)) byKey.set(key, []);
+          byKey.get(key).push(row.seniority);
+        }
+      }
+
+      // Compute rows
+      const out = [];
+      for (const [key, arr] of byKey.entries()) {
+        const [base, seat] = key.split('|');
+        const total = arr.length;
+        const rank = computeRank(arr, n);
+        const pct = total ? rank/total : 0;
+        out.push({ base, seat, rank, total, pct });
+      }
+
+      // Filters
+      const bf = baseSel.value, sf = seatSel.value;
+      const filtered = out
+        .filter(r => !bf || r.base === bf)
+        .filter(r => !sf || r.seat === sf);
+
+      // Sort
+      const key = sortSel.value;
+      filtered.sort((a,b) => {
+        if (key === 'base') return (a.base+a.seat).localeCompare(b.base+b.seat);
+        return a[key] - b[key];
+      });
+
+      // Render
+      const fmtPct = p => (p*100).toFixed(1) + '%';
+      tb.innerHTML = filtered.map(r => `
+        <tr class="${ r.rank <= 50 ? 'good' : '' }">
+          <td>${r.base}</td>
+          <td><span class="pill">${r.seat}</span></td>
+          <td>${r.rank}</td>
+          <td>${r.total}</td>
+          <td>${fmtPct(r.pct)}</td>
+        </tr>`).join('');
+
+      diag.textContent = `Bases loaded: ${out.length}. Showing: ${filtered.length}.`;
+    }
+
+    // Init
+    (async () => {
+      statusEl.textContent = 'Loading data…';
+      const packs = await loadAll();
+      // Populate base dropdown
+      const bases = Array.from(new Set(packs.flatMap(p => p.rows.map(r => r.base)))).sort();
+      for (const b of bases) { const opt = document.createElement('option'); opt.value = b; opt.textContent = b; baseSel.appendChild(opt); }
+      statusEl.textContent = 'Enter your company seniority number.';
+
+      document.getElementById('calc').addEventListener('click', () => run(packs));
+      senInput.addEventListener('keydown', e => { if (e.key === 'Enter') run(packs); });
+    })();
+  </script>
+</body>
+</html>
